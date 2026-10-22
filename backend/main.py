@@ -1,3 +1,4 @@
+import json
 import math
 import os
 from typing import Optional
@@ -8,22 +9,75 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from safetensors import safe_open
 
+MAX_HEADER_BYTES = 100 * 1024 * 1024
+
+MODEL_ROOT = os.path.realpath(
+    os.environ.get("TENSORFIELD_MODEL_ROOT", os.path.expanduser("~/models"))
+)
+
+_origins = os.environ.get(
+    "TENSORFIELD_ALLOWED_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+).split(",")
+
 app = FastAPI(title="Tensorfield Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_origins,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-# Single attached model held in process memory
 _attached_path: Optional[str] = None
 _tensor_index: dict = {}
 
 
 class InspectRequest(BaseModel):
     path: str
+
+
+def read_safetensors_header(path: str) -> dict:
+    file_size = os.path.getsize(path)
+
+    with open(path, "rb") as f:
+        length_bytes = f.read(8)
+        if len(length_bytes) != 8:
+            raise HTTPException(400, "Invalid SafeTensors header")
+
+        header_length = int.from_bytes(length_bytes, "little")
+
+        if header_length <= 0 or header_length > MAX_HEADER_BYTES or header_length > file_size - 8:
+            raise HTTPException(400, "Invalid SafeTensors header length")
+
+        header_bytes = f.read(header_length)
+        if len(header_bytes) != header_length:
+            raise HTTPException(400, "Truncated SafeTensors header")
+
+    try:
+        header = json.loads(header_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(400, "Malformed SafeTensors metadata")
+
+    if not isinstance(header, dict):
+        raise HTTPException(400, "Invalid SafeTensors metadata")
+
+    return header
+
+
+def resolve_path(raw: str) -> str:
+    path = os.path.realpath(os.path.expanduser(raw))
+
+    if not path.lower().endswith(".safetensors"):
+        raise HTTPException(400, "Only .safetensors files are supported")
+
+    if not os.path.isfile(path):
+        raise HTTPException(400, "SafeTensors file was not found")
+
+    if os.path.commonpath([MODEL_ROOT, path]) != MODEL_ROOT:
+        raise HTTPException(403, "Model path is outside the configured model directory")
+
+    return path
 
 
 @app.get("/v1/health")
@@ -35,22 +89,27 @@ def health():
 def inspect_model(req: InspectRequest):
     global _attached_path, _tensor_index
 
-    path = req.path
-
-    if not path.endswith(".safetensors"):
-        raise HTTPException(400, "Only .safetensors files are supported")
-    if not os.path.exists(path):
-        raise HTTPException(400, f"File not found: {path}")
-    if os.path.isdir(path):
-        raise HTTPException(400, "Path must be a file, not a directory")
+    path = resolve_path(req.path)
+    header = read_safetensors_header(path)
 
     tensors = []
-    with safe_open(path, framework="numpy", device="cpu") as f:
-        for name in f.keys():
-            meta = f.get_slice(name)
-            shape = list(meta.get_shape())
-            dtype = str(f.get_tensor(name).dtype) if len(shape) == 0 else _get_dtype(f, name, shape)
-            tensors.append({"name": name, "shape": shape, "dtype": dtype})
+    for name, metadata in header.items():
+        if name == "__metadata__":
+            continue
+        if not isinstance(metadata, dict):
+            continue
+
+        shape = metadata.get("shape")
+        dtype = metadata.get("dtype")
+
+        if not isinstance(shape, list) or not isinstance(dtype, str):
+            raise HTTPException(400, f"Invalid metadata for tensor: {name}")
+
+        tensors.append({"name": name, "shape": shape, "dtype": dtype})
+
+    # Validate the file is a well-formed SafeTensors checkpoint
+    with safe_open(path, framework="numpy", device="cpu"):
+        pass
 
     _attached_path = path
     _tensor_index = {t["name"]: t for t in tensors}
@@ -92,29 +151,17 @@ def tensor_slice(
         raise HTTPException(400, "Slice exceeds 256-element limit")
 
     with safe_open(_attached_path, framework="numpy", device="cpu") as f:
-        full = f.get_tensor(tensor)
+        tensor_view = f.get_slice(tensor)
+        window = tensor_view[row: row + rows, column: column + columns]
 
-    window = full[row:row + rows, column:column + columns].astype(float)
+    window = np.asarray(window, dtype=np.float64)
 
-    values = window.tolist()
-    for r in values:
-        for v in r:
-            if math.isnan(v) or math.isinf(v):
-                raise HTTPException(500, "Tensor contains NaN or Infinity values")
+    if not np.isfinite(window).all():
+        raise HTTPException(500, "Tensor slice contains NaN or Infinity")
 
     return {
         "tensor": tensor,
         "origin": [row, column],
         "shape": [rows, columns],
-        "values": values,
+        "values": window.tolist(),
     }
-
-
-def _get_dtype(f, name: str, shape: list) -> str:
-    if not shape:
-        return "unknown"
-    try:
-        t = f.get_tensor(name)
-        return str(t.dtype)
-    except Exception:
-        return "unknown"
